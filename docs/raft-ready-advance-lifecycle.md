@@ -50,7 +50,7 @@ func (r *raft) hardState() *pb.HardState {
 `HardState{Term, Vote, Commit}` 是 Raft 论文要求所有服务器持久化的状态。它出现在 `Ready.HardState` 中。
 
 - **非 AsyncStorageWrites 模式**：宿主必须在发送 `Ready.Messages` 之前把 `HardState` 和 `Entries` 持久化。
-- **AsyncStorageWrites 模式**：`HardState`/`Entries` 不再直接出现在 Ready 的顶层字段供宿主处理，而是被打包进 `MsgStorageAppend` 消息。
+- **AsyncStorageWrites 模式**：`HardState`、`Entries`、`Snapshot`、`CommittedEntries` 这些顶层字段**仍然会被 `readyWithoutAccept` 无条件填充**（见 [rawnode.go:142-161](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L142-L161)），宿主可以读取它们用于观察/调试，但**不应直接依据这些顶层字段执行持久化或应用动作**；同样的数据会被复制进 `Messages` 中的 `MsgStorageAppend`/`MsgStorageApply` 消息，由本地 append/apply 线程按消息驱动处理。若同时按顶层字段和存储消息操作，会导致重复持久化/应用。
 
 `MustSync`（[rawnode.go:191-198](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L191-L198)）指示本次 HardState/Entries 是否必须同步落盘：当 term 变化、vote 变化或有新 entries 时为 true。
 
@@ -144,21 +144,24 @@ sequenceDiagram
     Raft->>Raft: bcastAppend() → 给 F2/F3 的 MsgApp 放入 msgs
     Node-->>Caller: Propose 返回 nil<br/>(仅表示进入 raft，不表示已提交)
 
-    Note over Node,Host: === 阶段二：Ready 出队，宿主持久化并发消息 ===
-    Node->>Node: HasReady()=true，readyWithoutAccept()
-    Node->>Log: nextUnstableEnts() → Ready.Entries
-    Node->>Raft: hardState() → Ready.HardState
-    Node->>Node: Ready.Messages = msgs +<br/>msgsAfterAppend 中发给他人的部分
-    Node-->>Host: <-Ready()
-    Host->>Host: 1. save HardState + Entries 到 WAL<br/>(MustSync=true 时 fsync)
-    Host->>F2: 2. send MsgApp (Entries + Commit)
-    Host->>F3: 3. send MsgApp (Entries + Commit)
-    Note right of Host: 必须先持久化再发消息，<br/>否则 follower 持久化后 leader 崩溃<br/>会导致 committed 日志丢失
+    Note over Node,Host: === 阶段二：readyWithoutAccept 只读组装，不改变 raft 状态 ===
+    Node->>Node: HasReady()=true
+    Node->>Node: rd = rn.readyWithoutAccept()<br/>(填充 Entries/HardState/CommittedEntries/<br/>Messages，不推进任何游标)
+    Node-->>Host: <-Ready()  (rd 交给宿主)
+
+    Note right of Node: 两种接口在 acceptReady 时机上的区别：<br/>• Node：channel 发送成功后，run goroutine<br/>  立即调用 acceptReady（与宿主处理并发）<br/>• RawNode：Ready() 内部先 readyWithoutAccept<br/>  再 acceptReady，然后才返回给宿主<br/>两者都在宿主实际写 WAL/发消息之前<br/>完成 in-progress 标记。
 
     Node->>Node: acceptReady(rd)
-    Node->>Log: acceptUnstable()<br/>→ offsetInProgress 推进
-    Node->>Log: acceptApplying(lastCommitIdx, size, true)
-    Node->>Node: stepsOnAdvance 收集 self-MsgAppResp、<br/>StorageAppendResp、StorageApplyResp
+    Node->>Log: acceptUnstable()<br/>→ offsetInProgress 推进（标记持久化 in-progress）
+    Node->>Log: acceptApplying(lastIdx, size, true)<br/>→ applying 游标推进（标记应用 in-progress）
+    Node->>Node: self-MsgAppResp / StorageAppendResp /<br/>StorageApplyResp 收集到 stepsOnAdvance
+    Node->>Node: 清空 r.msgs / r.msgsAfterAppend
+
+    Note over Host,F3: === 阶段三：宿主处理第一个 Ready（持久化 + 发消息） ===
+    Host->>Host: 1. 保存 HardState + Entries 到 WAL<br/>(MustSync=true 时 fsync)
+    Host->>F2: 2. 发送 MsgApp (Entries + Commit)
+    Host->>F3: 3. 发送 MsgApp (Entries + Commit)
+    Note right of Host: 必须先持久化再发消息，<br/>否则 follower 持久化后 leader 崩溃<br/>会导致 committed 日志丢失
 
     Note over F2,F3: Follower 侧：收到 MsgApp
     F2->>F2: handleAppendEntries<br/>→ raftLog.maybeAppend<br/>→ 追加到本地 unstable
@@ -166,20 +169,25 @@ sequenceDiagram
     Host->>Host: 持久化 Entries
     Host->>Raft: 回送 MsgAppResp(index)
 
-    Note over Raft,Host: === 阶段三：多数派确认，推进 commit ===
-    Raft->>Raft: 收到 F2 的 MsgAppResp(非拒绝)
-    Raft->>Raft: pr.MaybeUpdate(index)
+    Note over Node,Host: === 阶段四：第一个 Advance 处理 self-ack，follower ack 到达 ===
+    Note over Raft: follower 的 MsgAppResp 经网络到达后<br/>由 node goroutine Step，<br/>pr.Match 前进
+    Host->>Node: Advance()  (针对第一个 Ready)
+    Node->>Raft: 依次 Step(stepsOnAdvance...)
+    Raft->>Raft: 1. self MsgAppResp<br/>→ pr[self].Match 前进
+    Raft->>Log: 2. MsgStorageAppendResp<br/>→ stableTo 截断 unstable
+    Note over Raft,Log: 此时 self/follower 的 Match<br/>陆续达到新 index
+
+    Note over Raft,Host: === 阶段五：多数派 Match 达到 → commit → 下一个 Ready 携带 CommittedEntries ===
     Raft->>Raft: maybeCommit()<br/>→ trk.Committed() 达到多数派
     Raft->>Log: commitTo(newCommit)
     Raft->>Raft: bcastAppend() (携带新 Commit)
-
-    Note over Node,Host: === 阶段四：CommittedEntries 交给宿主 apply ===
-    Node-->>Host: 下一个 Ready:<br/>CommittedEntries=[提案条目]
-    Host->>Host: 按顺序 apply 到状态机
+    Node-->>Host: 下一个 Ready:<br/>HardState.Commit=newCommit<br/>CommittedEntries=[提案条目]
+    Host->>Host: 持久化 HardState（仅 commit 推进）<br/>按顺序 apply 到状态机
     Host->>Caller: 业务层通知/响应调用方<br/>(raft 库不参与)
-    Host->>Node: Advance()
-    Node->>Raft: Step(stepsOnAdvance...)
-    Raft->>Log: stableTo(index,term)<br/>→ unstable 截断已持久化条目
+
+    Note over Node,Host: === 阶段六：第二个 Advance 推进 applied 游标 ===
+    Host->>Node: Advance()  (针对携带 CommittedEntries 的 Ready)
+    Node->>Raft: Step(MsgStorageApplyResp 等)
     Raft->>Log: appliedTo(index,size)<br/>→ applied 游标前进
     Raft->>Raft: reduceUncommittedSize (配额释放)
 
@@ -227,6 +235,7 @@ sequenceDiagram
 - `acceptReady` 时，自定向的 `MsgAppResp` 和合成的 `MsgStorageAppendResp`/`MsgStorageApplyResp` 被收集到 `stepsOnAdvance`（[rawnode.go:414-426](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L414-L426)）。
 - `Advance()` 时这些消息被 Step，leader 才真正把自己的 `Progress.Match` 推进到新 index，随后 `maybeCommit` 结合其他 follower 的响应计算 commit。
 - follower 侧的 `MsgAppResp` 在持久化后由宿主通过网络回送；这些响应到达 leader 后直接进入 `stepLeader` 的 `MsgAppResp` 分支。
+- 一次提案通常经历**两个 Ready 周期**：第一个 Ready 携带 `Entries`（发给 follower），其 `Advance` 处理 self `MsgAppResp`（推进 self Match）和 `MsgStorageAppendResp`（`stableTo`）；当多数派 Match 达到后 `maybeCommit` 推进 committed，第二个 Ready 携带 `HardState.Commit` 和 `CommittedEntries`，其 `Advance` 处理 `MsgStorageApplyResp`（`appliedTo`，释放配额）。follower 的 ack 可能在第一个 Advance 之前或之后到达，只要合计达到多数派即可推进 commit。
 
 测试参考：[testdata/single_node.txt](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/testdata/single_node.txt)、[testdata/lagging_commit.txt](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/testdata/lagging_commit.txt)。
 
@@ -331,13 +340,14 @@ AsyncStorageWrites 模式（`Config.AsyncStorageWrites=true`）将持久化和�
 
 Ready 组装差异（[rawnode.go:163-184](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L163-L184)）：
 
-- `Ready.Entries`、`Ready.HardState`、`Ready.Snapshot` 仍然被填充，但宿主**不需要立即处理**它们。
+- `Ready.Entries`、`Ready.HardState`、`Ready.Snapshot`、`Ready.CommittedEntries` 这些顶层字段**仍会像非 async 模式一样被 `readyWithoutAccept` 无条件填充**（[rawnode.go:142-161](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L142-L161)），宿主可以读取它们用于观察/日志，但**不应直接依据它们执行持久化或应用**；同样的数据会被复制进下面的存储消息，宿主应按消息驱动处理，避免对同一批条目操作两次。
 - 如果需要持久化，raft 合成一条 `MsgStorageAppend`（目标 `LocalAppendThread`），把 Entries/HardState/Snapshot 放进去，并把所有 `msgsAfterAppend` 作为 `Responses` 挂在该消息上。
-- 如果有 committed entries，合成一条 `MsgStorageApply`（目标 `LocalApplyThread`），把 CommittedEntries 放进去，并挂一条 `MsgStorageApplyResp` 作为响应。
+- 如果有 committed entries，raft 合成一条 `MsgStorageApply`（目标 `LocalApplyThread`），把 CommittedEntries 放进去，并挂一条 `MsgStorageApplyResp` 作为响应。
 - 这些本地存储消息和普通网络消息一起出现在 `Ready.Messages` 中。宿主需要：
   - 把 `To=LocalAppendThread` 的消息交给 append 线程（写 WAL）。
   - 把 `To=LocalApplyThread` 的消息交给 apply 线程（应用状态机）。
   - 其他消息通过网络发送（可以立即发送，不需要等持久化完成，因为依赖持久化的响应都挂在 StorageAppend 的 Responses 上）。
+- 与非 async 模式不同，`acceptReady` 在 async 模式下**不会**填充 `stepsOnAdvance`（[rawnode.go:410-427](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L410-L427)），self-MsgAppResp 和存储响应都被挂到存储消息的 `Responses` 上；但 `acceptUnstable()`/`acceptApplying()` 仍会被调用，in-progress 标记照常推进。
 
 Append 线程处理完 `MsgStorageAppend` 后，必须把 `m.Responses` 中的所有消息逐条交回 raft 的 `Step`（在 node goroutine 中，或宿主保证线程安全的等价方式）。这些响应包括：
 
@@ -369,17 +379,22 @@ Apply 线程处理完 `MsgStorageApply` 后，回送 `MsgStorageApplyResp`，raf
 
 ## 6. Ready → acceptReady → Advance 内部动作对照
 
-以非 async 模式为例，一次 Ready 循环中 raft 内部状态变化如下：
+以非 async 模式为例，一次 Ready 循环中 raft 内部状态变化如下。注意 `acceptReady` 发生在 Ready 交给宿主**之时**（而非宿主处理完之后），这是容易搞错的地方：
 
 | 时机 | 函数/位置 | 动作 |
 |------|-----------|------|
 | `HasReady()` | [rawnode.go:448-470](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L448-L470) | 检查 SoftState/HardState 变化、unstable entries/snapshot、committed entries、msgs、readStates |
-| `readyWithoutAccept()` | [rawnode.go:139-187](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L139-L187) | 只读地组装 Ready；不改变 raft 状态 |
-| Ready 发给宿主 | `<-n.Ready()` | 宿主开始处理：存 HardState/Entries/Snapshot、发 Messages、apply CommittedEntries |
-| `acceptReady(rd)` | [rawnode.go:400-438](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L400-L438) | 更新 prevSoftSt/prevHardSt；清空 readStates；把 self-msgsAfterAppend 和合成的 Storage 响应收集到 stepsOnAdvance；清空 r.msgs/r.msgsAfterAppend；`raftLog.acceptUnstable()` 推进 offsetInProgress；`acceptApplying()` 推进 applying 游标和 applyingEntsSize |
-| 宿主处理完 Ready | 宿主调用 `Advance()` |  |
-| `Advance(rd)` | [rawnode.go:477-489](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L477-L489) | 依次 Step stepsOnAdvance 中的消息：<br>1. self `MsgAppResp`/`MsgVoteResp`：推进 Progress/计票<br>2. `MsgStorageAppendResp`：`raftLog.stableTo` 截断 unstable<br>3. `MsgStorageApplyResp`：`raftLog.appliedTo` 推进 applied |
+| `readyWithoutAccept()` | [rawnode.go:139-187](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L139-L187) | 只读地组装 Ready（填充顶层 Entries/HardState/Snapshot/CommittedEntries/Messages）；**不改变 raft 状态、不推进任何游标** |
+| Ready 交给宿主 | `<-n.Ready()`（Node）或 `rn.Ready()` 返回（RawNode） | 宿主拿到 Ready 后开始处理：存 HardState/Entries/Snapshot、发 Messages、apply CommittedEntries |
+| `acceptReady(rd)` | [rawnode.go:400-438](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L400-L438) | **在宿主收到 Ready 的同时即执行**：Node 在 `readyc <- rd` 成功后于 run goroutine 中调用（[node.go:435-436](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/node.go#L435-L436)）；RawNode 则在 `Ready()` 返回前调用（[rawnode.go:131-135](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L131-L135)）。更新 prevSoftSt/prevHardSt、清空 readStates；把 self-msgsAfterAppend 和合成的 Storage 响应收集到 stepsOnAdvance；清空 r.msgs/r.msgsAfterAppend；`raftLog.acceptUnstable()` 推进 offsetInProgress；`acceptApplying()` 推进 applying 游标和 applyingEntsSize |
+| 宿主处理完 Ready | 宿主调用 `Advance()` | 宿主必须在持久化、发消息、apply 全部完成后才调用 |
+| `Advance(rd)` | [rawnode.go:477-489](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/rawnode.go#L477-L489) | 依次 Step stepsOnAdvance 中的消息：<br>1. self `MsgAppResp`/`MsgVoteResp`：推进 Progress/计票<br>2. `MsgStorageAppendResp`：`raftLog.stableTo` 截断 unstable（确认条目真正落盘）<br>3. `MsgStorageApplyResp`：`raftLog.appliedTo` 推进 applied（确认状态机已应用） |
 | 下一轮 `HasReady()` |  | 如果上述 Step 产生了新消息或 commit 推进，会立即组装下一个 Ready |
+
+关键区别：
+
+- **acceptReady 推进的是 `offsetInProgress`/`applying`**，语义是"这些条目已经交给宿主，正在处理中"，并不代表已经落盘或已经应用。因此它可以在宿主实际处理之前执行。
+- **Advance 推进的是 `offset`（stableTo）/`applied`**，语义是"宿主确认已经落盘/已经应用"，必须在宿主真正完成工作后才调用。
 
 注意 [node.go:354-365](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Athena/node.go#L354-L365) 中的注释：`readyWithoutAccept` 可能在 Ready 被真正发送前被多次调用（因为 node run loop 可能先处理了其他 channel）。这不影响正确性，因为它是只读的，真正的状态转移发生在 `acceptReady`。
 

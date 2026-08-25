@@ -35,9 +35,27 @@
 | **已复制 (replicated)** | 该条目出现在某个 follower 的日志里，follower 用 `MsgAppResp` 回执确认。 | 库（leader 追踪 `Progress.Match`） | `handleAppendEntries` 回 `MsgAppResp`（[raft.go:1800](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1800-L1802)）；leader 侧 `pr.MaybeUpdate`（[raft.go:1527](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1527)） |
 | **已提交 (committed)** | 该 index 已在**多数派**的稳定存储上，且满足当前任期约束，`raftLog.committed` 前进到 ≥ 它。**一旦提交即不可回滚。** | 库 | `raft.maybeCommit` → `raftLog.maybeCommit` → `commitTo`（[raft.go:774](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L774-L778)、[log.go:455](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/log.go#L455-L464)） |
 | **已应用 (applied)** | 宿主状态机真正执行了该条目（写入业务存储/内存表）。 | **宿主**执行；库只通过 `Ready.CommittedEntries` 投递并跟踪 `applied` 游标 | 宿主消费 `CommittedEntries` → `Advance` → `raftLog.appliedTo`（[log.go:332](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/log.go#L332-L345)） |
-| **调用方已收到结果 (client-visible)** | 发起 `Propose` 的业务调用方能读到该命令产生的状态机结果。 | **宿主**（`Propose` 只保证「提交到 raft 输入队列」，不保证提交，也不返回结果） | `node.Propose` 的返回只表示 `Step` 被执行完（[node.go:471](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L471-L473)、[node.go:514](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L514-L551)） |
+| **调用方已收到结果 (client-visible)** | 发起 `Propose` 的业务调用方能读到该命令产生的状态机结果。 | **宿主**（`Propose` 只表示这条 `MsgProp` 被本节点 `Step` 处理完：leader 上是本地追加、follower 上是转发、无 leader/禁转发/candidate 时是丢弃；均不保证提交，也不返回结果，见 §1.1） | `node.Propose` 的返回只表示 `Step` 被执行完（[node.go:471](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L471-L473)、[node.go:514](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L514-L551)） |
 
-**关键结论（对应线上问题 1）**：`Propose` 返回 `nil` 只代表提案进入了 leader 的 `MsgProp` 处理并被追加到本地 unstable log，**既不代表已持久化，也不代表已提交、已应用**。调用方看到结果必须由宿主自己在应用 `CommittedEntries` 时通过 `Index` 唤醒等待者（本库不提供 proposal→result 的关联，见 [node.go:139](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L138-L140) 的注释「proposals can be lost without notice」）。
+**关键结论（对应线上问题 1）**：`Propose` 返回 `nil` **只代表这条 `MsgProp` 被本节点的 `Step` 处理完毕、没有返回错误**，而处理的具体结果取决于本节点当时的角色，见下节 §1.1。它**既不代表已持久化，也不代表已提交、已应用**；即使在 leader 上「已本地追加」，也可能随后因失去领导权被覆盖（见场景 D）。调用方看到结果必须由宿主自己在应用 `CommittedEntries` 时通过 `Index` 唤醒等待者（本库不提供 proposal→result 的关联，见 [node.go:139](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L138-L140) 的注释「proposals can be lost without notice」）。
+
+### 1.1 `Propose` 的三种结果：本地追加 / 转发 / 丢弃
+
+一条 `MsgProp` 进入状态机后，`Step` 按当前角色分派（leader→`stepLeader`、follower→`stepFollower`、candidate/pre-candidate→`stepCandidate`），共有三种结果。**是否本地追加、`Propose` 返回什么、以及后续能否持久化/提交，完全取决于命中哪一种：**
+
+| 结果 | 触发条件 | 本节点是否追加到 unstable log | `Propose` 返回值 | 代码 |
+| --- | --- | --- | --- | --- |
+| **A. leader 本地追加** | 本节点是 leader（且未在转移领导权、仍是成员） | **是**：`appendEntry` 分配 `Index/Term` 并入 unstable，随后 `bcastAppend` | `nil`（追加失败如超出未提交大小上限则返回 `ErrProposalDropped`） | `stepLeader` MsgProp（[raft.go:1294](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1294-L1353)） |
+| **B. follower 转发** | 本节点是 follower 且 `r.lead != None` 且**未**禁用转发 | **否**：仅把 `MsgProp` 的 `To` 改成 leader 并 `r.send` 转发出去，追加发生在 leader 上 | `nil`（"发出去了"，不代表 leader 收到/追加/提交） | `stepFollower` MsgProp（[raft.go:1728-1729](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1720-L1729)） |
+| **C. 无 leader / 禁用转发 / candidate 期间丢弃** | follower 且 `r.lead == None`；或 follower 且 `disableProposalForwarding`；或本节点处于 candidate/pre-candidate（正在选举，无 leader） | **否**：直接丢弃 | `ErrProposalDropped` | follower 无 leader（[raft.go:1721-1723](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1721-L1723)）、禁用转发（[raft.go:1724-1726](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1724-L1726)）、candidate（[raft.go:1684-1686](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/raft.go#L1684-L1686)） |
+
+对三种结果，`Propose` 返回值与「本地追加/持久化/提交」的关系：
+
+- **返回 `ErrProposalDropped`（结果 C，或结果 A 中追加被拒）**：确定性失败。本节点没有追加，也不会有任何后续；leader 更不会看到它。宿主应立即重试或改投其他节点，**不能**当作"稍后会提交"。
+- **返回 `nil`（结果 A）**：仅表示已在 **本 leader** 的 unstable log 里「已追加」。这**不保证已持久化**（还要等 `Ready.Entries` 被宿主落盘），**不保证已提交**（还要多数派复制），失去领导权时甚至会被新 leader 覆盖（场景 D）。
+- **返回 `nil`（结果 B）**：仅表示 `MsgProp` 已通过 `r.msgs` **转发**给当时认为的 leader。这**连"本地追加"都没有**，更不保证 leader 收到（消息可能丢）、追加、或提交。转发是"尽力而为"，与"提案已被接受"无任何等价关系。
+
+> 说明：`node`（异步 `Node` 实现）中，`propc` 只有在本节点感知到"有 leader"时才被 armed（[node.go:367-380](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L367-L380)）。因此在 leaderless 期间，`Node.Propose` 会**阻塞在 `propc` 上直到出现 leader 或 `ctx` 超时**（[node.go:525-539](file:///e:/newGsb/generated/question-exchange/questions/GSB-003/Poseidon/node.go#L525-L539)），而不是立刻拿到 `ErrProposalDropped`；`ErrProposalDropped` 主要出现在 leader 拒收、follower 禁用转发、candidate 期间等 `Step` 真正被执行到的路径（以及直接使用 `RawNode.Propose` 时）。宿主务必对 `Propose` 同时处理 **返回错误、`ctx` 超时、以及"返回 nil 但最终未提交"** 三种情况。
 
 ---
 
@@ -248,6 +266,10 @@ storage(已落盘)         | entries 在内存中
 
 **问题 1「WAL 里有，但调用方看不到结果」**
 
+0. **先确认 `Propose` 命中了哪种结果（§1.1）**，因为只有"结果 A：leader 本地追加"才会真的进入本节点 WAL：
+   - 返回 `ErrProposalDropped` → 结果 C：提案被丢弃（无 leader/禁用转发/candidate 期间），从未追加。宿主是否有重试？
+   - 返回 `nil` 但本节点是 **follower** → 结果 B：只是转发给 leader，本地 WAL 里本就不该有该条目；应去 **leader** 上排查，并确认转发消息与 `MsgApp` 回来的复制是否成功。
+   - 返回 `nil` 且本节点是 **leader** → 结果 A：已本地追加，继续下面第 1 步。
 1. 看 `Status()`：`Commit` 是否 ≥ 该条目 index？
    - 否 → 停在「已持久化未提交」。可能是失去领导权（场景 D）或多数派未达成（网络/follower 落后）。检查各 `Progress.Match`。
 2. `Commit` ≥ index 但 `Applied` < index → 停在「已提交未应用」（场景 E）。检查宿主 apply 线程是否卡住、是否触发 `maxApplyingEntsSize` 限流、`Advance` 是否被调用。

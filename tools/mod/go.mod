@@ -1,0 +1,69 @@
+module go.etcd.io/raft/tools/v3
+
+go 1.26
+
+toolchain go1.26.4
+
+require (
+	github.com/alexkohler/nakedret v1.0.0
+	github.com/chzchzchz/goword v0.0.0-20170907005317-a9744cb52b03
+	github.com/coreos/license-bill-of-materials v0.0.0-20190913234955-13baff47494e
+	github.com/google/addlicense v1.0.0
+	github.com/gordonklaus/ineffassign v0.0.0-20210914165742-4cc7213b9bc8
+	github.com/gyuho/gocovmerge v0.0.0-20171205171859-50c7e6afd535
+	github.com/mdempsky/unconvert v0.0.0-20200228143138-95ecdbfc0b5f
+	github.com/mgechev/revive v1.13.0
+	github.com/mikefarah/yq/v4 v4.24.2
+	go.etcd.io/gofail v0.0.0-20221125214112-fc21f61ba88a
+	go.etcd.io/protodoc v0.0.0-20180829002748-484ab544e116
+	golang.org/x/tools v0.42.0
+	google.golang.org/protobuf v1.36.11
+	gotest.tools/gotestsum v1.13.0
+	gotest.tools/v3 v3.5.2
+	honnef.co/go/tools v0.3.0
+	mvdan.cc/unparam v0.0.0-20220316160445-06cc5682983b
+)
+
+require (
+	codeberg.org/chavacava/garif v0.2.0 // indirect
+	github.com/BurntSushi/toml v1.5.0 // indirect
+	github.com/a8m/envsubst v1.3.0 // indirect
+	github.com/akhenakh/hunspellgo v0.0.0-20160221122622-9db38fa26e19 // indirect
+	github.com/bitfield/gotestdox v0.2.2 // indirect
+	github.com/bmatcuk/doublestar/v4 v4.0.2 // indirect
+	github.com/dnephin/pflag v1.0.7 // indirect
+	github.com/elliotchance/orderedmap v1.4.0 // indirect
+	github.com/fatih/color v1.18.0 // indirect
+	github.com/fatih/structtag v1.2.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/goccy/go-yaml v1.9.5 // indirect
+	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
+	github.com/hashicorp/go-version v1.7.0 // indirect
+	github.com/inconshreveable/mousetrap v1.0.0 // indirect
+	github.com/jinzhu/copier v0.3.5 // indirect
+	github.com/kr/text v0.2.0 // indirect
+	github.com/magiconair/properties v1.8.6 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mgechev/dots v1.0.0 // indirect
+	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
+	github.com/spf13/afero v1.15.0 // indirect
+	github.com/spf13/cobra v1.4.0 // indirect
+	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/timtadh/data-structures v0.5.3 // indirect
+	github.com/timtadh/lexmachine v0.2.2 // indirect
+	github.com/trustmaster/go-aspell v0.0.0-20200701131845-c2b1f55bec8f // indirect
+	golang.org/x/exp/typeparams v0.0.0-20220218215828-6cf2b201936e // indirect
+	golang.org/x/mod v0.34.0 // indirect
+	golang.org/x/net v0.50.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260209163413-e7419c687ee4 // indirect
+	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/tools/go/expect v0.1.1-deprecated // indirect
+	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
+	gopkg.in/check.v1 v1.0.0-20200227125254-8fa46927fb4f // indirect
+	gopkg.in/op/go-logging.v1 v1.0.0-20160211212156-b2cb9fa56473 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)

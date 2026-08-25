@@ -173,7 +173,7 @@ sequenceDiagram
 - `applying`：已通过 Ready 交给宿主的最大 committed 位置（`acceptApplying`，log.go:347）。受 `MaxCommittedSizePerReady` 配额约束（`applyingEntsSize`/`applyingEntsPaused`，log.go:53-63、220-234），配额满时 Ready 暂停产出 CommittedEntries。
 - `applied`：宿主已确认应用完成的最大位置（`appliedTo`，log.go:332，由 Advance/`MsgStorageApplyResp` 驱动）。**不持久化**。
 - 不变式 `applied ≤ applying ≤ committed`；`appliedTo` 越界直接 panic（log.go:333-334）。
-- 重启初始化（log.go:75-100、raft.go:439-486）：三者先设为 `Storage.FirstIndex()-1`；`loadState` 用持久化的 `HardState` 恢复 `committed/Term/Vote`；`Config.Applied > 0` 时用宿主的 applied 恢复 `applied`。**若宿主不给 `Config.Applied`，raft 会把 `(firstIndex-1, committed]` 全部重新作为 `CommittedEntries` 投递**（测试：`TestNodeRestart` node_test.go:566、`TestRawNodeRestart` rawnode.go:660——期望 Ready 恰含 commit 以内的全部条目）。
+- 重启初始化（log.go:75-100、raft.go:439-486）：三者先设为 `Storage.FirstIndex()-1`；`loadState` 用持久化的 `HardState` 恢复 `committed/Term/Vote`；`Config.Applied > 0` 时用宿主的 applied 恢复 `applied`。**若宿主不给 `Config.Applied`，raft 会把 `(firstIndex-1, committed]` 全部重新作为 `CommittedEntries` 投递**（测试：`TestNodeRestart` node_test.go:566、`TestRawNodeRestart` rawnode_test.go:660——期望 Ready 恰含 commit 以内的全部条目）。
 
 ### 5.3 Progress.Match/Next 与 committed 的闭环（leader 侧）
 
